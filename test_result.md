@@ -207,10 +207,10 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Question Management System"
-    - "Progress Tracking API"
-    - "Database Setup MongoDB"
     - "Mobile-First Question Display Interface"
+    - "Progress Tracking Dashboard"
+    - "Topic Selection System"
+    - "Dark Mode Support"
   stuck_tasks: []
   test_all: true
   test_priority: "high_first"
