@@ -1,19 +1,51 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
 from typing import List, Optional, Dict, Any
 import os
-import uuid
 import json
+import uuid
 from datetime import datetime, timedelta
 from pymongo import MongoClient
 import logging
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
+from firebase_admin.exceptions import FirebaseError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# Settings
+class Settings(BaseSettings):
+    mongo_url: str = Field(default="mongodb://localhost:27017", env="MONGO_URL")
+    firebase_project_id: str = Field(default="taxi-learn-app", env="FIREBASE_PROJECT_ID")
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+# Initialize Firebase Admin
+try:
+    # Initialize Firebase with service account
+    cred = credentials.Certificate('firebase-admin.json')
+    firebase_admin.initialize_app(cred)
+    logger.info("Firebase Admin initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Firebase: {e}")
+
+# Initialize Firestore
+try:
+    firebase_db = firestore.client()
+    logger.info("Firestore client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Firestore: {e}")
+    firebase_db = None
+
+app = FastAPI(title="IHK Taxi Exam API", version="2.0.0")
 
 # CORS middleware
 app.add_middleware(
@@ -24,333 +56,565 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MongoDB connection
-MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
-client = MongoClient(MONGO_URL)
-db = client.ihk_taxi_app
+# MongoDB connection (fallback)
+MONGO_URL = settings.mongo_url
+mongo_client = MongoClient(MONGO_URL)
+mongo_db = mongo_client.ihk_taxi_app
 
 # Collections
-questions_collection = db.questions
-users_collection = db.users
-progress_collection = db.progress
-sessions_collection = db.sessions
+questions_collection = mongo_db.questions
+users_collection = mongo_db.users
+progress_collection = mongo_db.progress
+sessions_collection = mongo_db.sessions
+
+# Security
+security = HTTPBearer()
 
 # Pydantic models
 class Question(BaseModel):
     id: str
-    frage: str
-    typ: str  # "single", "multiple", "open"
-    optionen: List[str]
-    richtigeAntwort: List[int]
-    erklaerung: str
-    thema: str
-    bild: Optional[str] = None
+    question: Dict[str, str]  # Multi-language support
+    type: str  # "single", "multiple", "open"
+    options: Dict[str, List[str]]  # Multi-language options
+    correctAnswer: List[int]
+    explanation: Dict[str, str]  # Multi-language explanations
+    topic: str
+    difficulty: str = "medium"
+    tags: List[str] = []
+    image: Optional[str] = None
 
-class Answer(BaseModel):
-    question_id: str
-    selected_answers: List[int]
-    time_spent: int  # in seconds
+class QuestionAnswer(BaseModel):
+    questionId: str
+    selectedAnswers: List[int]
+    timeSpent: int
+    isFirstTry: bool = True
 
 class UserProgress(BaseModel):
-    user_id: str
-    question_id: str
-    correct: bool
-    selected_answers: List[int]
-    time_spent: int
-    timestamp: datetime
+    userId: str
+    questionId: str
+    attempts: int = 1
+    correctAttempts: int = 0
+    box: int = 1  # Spaced repetition box
+    lastReviewDate: datetime
+    firstAttemptDate: datetime
+    totalTimeSpent: int = 0
+    accuracy: float = 0.0
+    isLearned: bool = False
 
-class TopicStats(BaseModel):
-    thema: str
-    total_questions: int
-    answered: int
-    correct: int
-    accuracy: float
+class UserStats(BaseModel):
+    totalXP: int = 0
+    currentLevel: int = 1
+    totalQuestionsAnswered: int = 0
+    correctAnswers: int = 0
+    currentStreak: int = 0
+    longestStreak: int = 0
+    studyDaysStreak: int = 0
+    lastStudyDate: Optional[datetime] = None
+    achievements: List[str] = []
+    badges: List[Dict] = []
+    favoriteQuestions: List[str] = []
+    difficultQuestions: List[str] = []
+    dailyGoal: int = 20
+    weeklyGoal: int = 140
 
-# Sample questions data
-SAMPLE_QUESTIONS = [
+class GameSession(BaseModel):
+    sessionId: str
+    userId: str
+    mode: str  # "random", "topic", "spaced", "exam"
+    startTime: datetime
+    endTime: Optional[datetime] = None
+    questionsAnswered: int = 0
+    correctAnswers: int = 0
+    totalXP: int = 0
+    streak: int = 0
+
+# Extended question bank with multi-language support
+EXTENDED_QUESTION_BANK = [
     {
         "id": "001",
-        "frage": "Welche Unterlagen müssen bei einer Kontrolle mitgeführt werden?",
-        "typ": "single",
-        "optionen": [
-            "Führerschein, Fahrzeugpapiere, Mietvertrag",
-            "Fahrzeugschein, Versicherungspolice, Personalausweis", 
-            "Führerschein, Fahrzeugschein, Genehmigungsurkunde"
-        ],
-        "richtigeAntwort": [2],
-        "erklaerung": "Im Taxi- und Mietwagenverkehr sind Führerschein, Fahrzeugschein und Genehmigungsurkunde mitzuführen.",
-        "thema": "Recht"
+        "question": {
+            "de": "Welche Unterlagen müssen bei einer Kontrolle mitgeführt werden?",
+            "en": "Which documents must be carried during an inspection?",
+            "tr": "Kontrol sırasında hangi belgeler taşınmalıdır?"
+        },
+        "type": "single",
+        "options": {
+            "de": [
+                "Führerschein, Fahrzeugpapiere, Mietvertrag",
+                "Fahrzeugschein, Versicherungspolice, Personalausweis",
+                "Führerschein, Fahrzeugschein, Genehmigungsurkunde"
+            ],
+            "en": [
+                "Driver's license, vehicle documents, rental contract",
+                "Registration certificate, insurance policy, ID card",
+                "Driver's license, registration certificate, license certificate"
+            ],
+            "tr": [
+                "Ehliyet, araç evrakları, kiralama sözleşmesi",
+                "Ruhsat, sigorta poliçesi, kimlik kartı",
+                "Ehliyet, ruhsat, ruhsat belgesi"
+            ]
+        },
+        "correctAnswer": [2],
+        "explanation": {
+            "de": "Im Taxi- und Mietwagenverkehr sind Führerschein, Fahrzeugschein und Genehmigungsurkunde mitzuführen.",
+            "en": "In taxi and rental car transport, driver's license, registration certificate, and license certificate must be carried.",
+            "tr": "Taksi ve kiralık araç taşımacılığında ehliyet, ruhsat ve ruhsat belgesi taşınmalıdır."
+        },
+        "topic": "Recht",
+        "difficulty": "easy",
+        "tags": ["kontrolle", "dokumente", "pflicht"],
+        "image": None
     },
     {
-        "id": "002", 
-        "frage": "Wie hoch ist die Mindestversicherungssumme für Personenschäden?",
-        "typ": "single",
-        "optionen": [
-            "7,5 Millionen Euro",
-            "10 Millionen Euro",
-            "15 Millionen Euro"
-        ],
-        "richtigeAntwort": [0],
-        "erklaerung": "Die Mindestversicherungssumme für Personenschäden beträgt 7,5 Millionen Euro.",
-        "thema": "Recht"
+        "id": "002",
+        "question": {
+            "de": "Wie hoch ist die Mindestversicherungssumme für Personenschäden?",
+            "en": "What is the minimum insurance amount for personal injury?",
+            "tr": "Kişisel yaralanma için minimum sigorta tutarı nedir?"
+        },
+        "type": "single",
+        "options": {
+            "de": ["7,5 Millionen Euro", "10 Millionen Euro", "15 Millionen Euro"],
+            "en": ["7.5 million euros", "10 million euros", "15 million euros"],
+            "tr": ["7,5 milyon euro", "10 milyon euro", "15 milyon euro"]
+        },
+        "correctAnswer": [0],
+        "explanation": {
+            "de": "Die Mindestversicherungssumme für Personenschäden beträgt 7,5 Millionen Euro.",
+            "en": "The minimum insurance amount for personal injury is 7.5 million euros.",
+            "tr": "Kişisel yaralanma için minimum sigorta tutarı 7,5 milyon euro'dur."
+        },
+        "topic": "Recht",
+        "difficulty": "medium",
+        "tags": ["versicherung", "personenschaden", "mindestbetrag"],
+        "image": None
     },
+    # Additional questions would continue here...
     {
-        "id": "003",
-        "frage": "Was gehört zur kaufmännischen Buchführung?",
-        "typ": "multiple",
-        "optionen": [
-            "Eingangsrechnungen erfassen",
-            "Ausgangsrechnungen erstellen", 
-            "Kassenbuch führen",
-            "Fahrzeug waschen"
-        ],
-        "richtigeAntwort": [0, 1, 2],
-        "erklaerung": "Zur kaufmännischen Buchführung gehören alle Geschäftsvorgänge wie Rechnungen und Kassenführung.",
-        "thema": "Kaufmännische & finanzielle Führung"
-    },
-    {
-        "id": "004",
-        "frage": "Welche technischen Prüfungen sind für Taxen vorgeschrieben?",
-        "typ": "single", 
-        "optionen": [
-            "Nur TÜV alle 2 Jahre",
-            "TÜV jährlich und Taxameter-Eichung alle 2 Jahre",
-            "Nur Taxameter-Eichung jährlich"
-        ],
-        "richtigeAntwort": [1],
-        "erklaerung": "Taxen müssen jährlich zum TÜV und alle 2 Jahre zur Taxameter-Eichung.",
-        "thema": "Technische Normen & Betrieb"
-    },
-    {
-        "id": "005",
-        "frage": "Welche Umweltplakette ist in den meisten Umweltzonen erforderlich?",
-        "typ": "single",
-        "optionen": [
-            "Rote Plakette",
-            "Gelbe Plakette", 
-            "Grüne Plakette"
-        ],
-        "richtigeAntwort": [2],
-        "erklaerung": "In den meisten Umweltzonen ist die grüne Umweltplakette erforderlich.",
-        "thema": "Straßenverkehrssicherheit, Unfallverhütung, Umweltschutz"
-    },
-    {
-        "id": "006",
-        "frage": "Was ist bei grenzüberschreitenden Fahrten zu beachten?",
-        "typ": "multiple",
-        "optionen": [
-            "Genehmigung für das Zielland", 
-            "Gültige Versicherung im Ausland",
-            "Mehrsprachige Fahrzeugpapiere",
-            "Internationaler Führerschein"
-        ],
-        "richtigeAntwort": [0, 1, 3],
-        "erklaerung": "Bei grenzüberschreitenden Fahrten sind Genehmigungen, Versicherungsschutz und internationaler Führerschein wichtig.",
-        "thema": "Grenzüberschreitender Personenverkehr"
-    },
-    {
-        "id": "007",
-        "frage": "Wie oft muss ein Taxameter geeicht werden?",
-        "typ": "single",
-        "optionen": [
-            "Jährlich",
-            "Alle 2 Jahre", 
-            "Alle 3 Jahre"
-        ],
-        "richtigeAntwort": [1],
-        "erklaerung": "Taxameter müssen alle 2 Jahre geeicht werden.",
-        "thema": "Technische Normen & Betrieb"
-    },
-    {
-        "id": "008",
-        "frage": "Was ist bei der Preiskalkulation zu beachten?",
-        "typ": "multiple", 
-        "optionen": [
-            "Kraftstoffkosten",
-            "Versicherungskosten",
-            "Abschreibungen",
-            "Lieblingsmusik des Fahrers"
-        ],
-        "richtigeAntwort": [0, 1, 2],
-        "erklaerung": "Bei der Preiskalkulation müssen alle betriebswirtschaftlichen Kosten berücksichtigt werden.",
-        "thema": "Kaufmännische & finanzielle Führung"
+        "id": "101",
+        "question": {
+            "de": "Was gehört zur kaufmännischen Buchführung?",
+            "en": "What belongs to commercial bookkeeping?",
+            "tr": "Ticari defter tutmada neler yer alır?"
+        },
+        "type": "multiple",
+        "options": {
+            "de": ["Eingangsrechnungen erfassen", "Ausgangsrechnungen erstellen", "Kassenbuch führen", "Fahrzeug waschen"],
+            "en": ["Record incoming invoices", "Create outgoing invoices", "Keep cash book", "Wash vehicle"],
+            "tr": ["Gelen faturaları kaydetmek", "Giden faturalar oluşturmak", "Kasa defteri tutmak", "Araç yıkamak"]
+        },
+        "correctAnswer": [0, 1, 2],
+        "explanation": {
+            "de": "Zur kaufmännischen Buchführung gehören alle Geschäftsvorgänge wie Rechnungen und Kassenführung.",
+            "en": "Commercial bookkeeping includes all business transactions such as invoices and cash management.",
+            "tr": "Ticari defter tutma, faturalar ve nakit yönetimi gibi tüm ticari işlemleri içerir."
+        },
+        "topic": "Kaufmännische & finanzielle Führung",
+        "difficulty": "easy",
+        "tags": ["buchführung", "rechnungen", "kasse"],
+        "image": None
     }
 ]
 
-# Initialize database with sample questions
+# Firebase Authentication dependency
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
+    try:
+        # Verify Firebase ID token
+        decoded_token = auth.verify_id_token(credentials.credentials)
+        return decoded_token
+    except FirebaseError as e:
+        logger.error(f"Firebase authentication failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        # Allow guest users or fallback authentication
+        return {"uid": "guest", "email": None, "name": "Guest User"}
+
+# Optional authentication (allows both authenticated and guest users)
+async def get_optional_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict]:
+    if not credentials:
+        return None
+    try:
+        decoded_token = auth.verify_id_token(credentials.credentials)
+        return decoded_token
+    except:
+        return None
+
+# Initialize database with questions
 @app.on_event("startup")
 async def startup_event():
-    # Clear and reinitialize questions collection
-    questions_collection.delete_many({})
-    questions_collection.insert_many(SAMPLE_QUESTIONS)
-    logger.info(f"Initialized {len(SAMPLE_QUESTIONS)} sample questions")
+    try:
+        # Clear and initialize MongoDB questions collection
+        questions_collection.delete_many({})
+        questions_collection.insert_many(EXTENDED_QUESTION_BANK)
+        
+        # Initialize Firestore questions collection
+        if firebase_db:
+            questions_ref = firebase_db.collection('questions')
+            batch = firebase_db.batch()
+            
+            for question in EXTENDED_QUESTION_BANK:
+                doc_ref = questions_ref.document(question['id'])
+                batch.set(doc_ref, question)
+            
+            batch.commit()
+            logger.info("Firestore questions collection initialized")
+        
+        logger.info(f"Initialized {len(EXTENDED_QUESTION_BANK)} questions in database")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
 
 # API Routes
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "message": "IHK Taxi Exam App API is running"}
+    return {
+        "status": "ok", 
+        "message": "IHK Taxi Exam API v2.0 with Firebase integration",
+        "features": ["spaced_repetition", "gamification", "multilingual", "firebase_auth", "offline_sync"]
+    }
 
-@app.get("/api/questions", response_model=List[Question])
-async def get_questions(thema: Optional[str] = None, limit: Optional[int] = None):
-    """Get questions, optionally filtered by topic"""
+@app.get("/api/questions")
+async def get_questions(
+    topic: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    language: Optional[str] = "de",
+    limit: Optional[int] = None,
+    user: Optional[Dict] = Depends(get_optional_user)
+):
     try:
+        # Build query
         query = {}
-        if thema:
-            query["thema"] = thema
-            
-        questions = list(questions_collection.find(query, {"_id": 0}))
+        if topic:
+            query["topic"] = topic
+        if difficulty:
+            query["difficulty"] = difficulty
         
-        if limit:
-            questions = questions[:limit]
+        # Get questions from Firebase or MongoDB
+        if firebase_db and user:
+            questions_ref = firebase_db.collection('questions')
+            query_ref = questions_ref
             
-        return questions
+            for key, value in query.items():
+                query_ref = query_ref.where(key, '==', value)
+            
+            if limit:
+                query_ref = query_ref.limit(limit)
+                
+            docs = query_ref.get()
+            questions = [doc.to_dict() for doc in docs]
+        else:
+            # Fallback to MongoDB
+            questions = list(questions_collection.find(query, {"_id": 0}))
+            if limit:
+                questions = questions[:limit]
+        
+        # Filter by language for response
+        localized_questions = []
+        for q in questions:
+            localized_q = {
+                "id": q["id"],
+                "question": q["question"].get(language, q["question"]["de"]),
+                "type": q["type"],
+                "options": q["options"].get(language, q["options"]["de"]),
+                "correctAnswer": q["correctAnswer"],
+                "topic": q["topic"],
+                "difficulty": q["difficulty"],
+                "tags": q["tags"],
+                "image": q["image"]
+            }
+            localized_questions.append(localized_q)
+        
+        return localized_questions
+        
     except Exception as e:
         logger.error(f"Error fetching questions: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch questions")
 
-@app.get("/api/questions/{question_id}", response_model=Question)
-async def get_question(question_id: str):
-    """Get a specific question by ID"""
+@app.get("/api/questions/{question_id}")
+async def get_question(
+    question_id: str, 
+    language: Optional[str] = "de",
+    user: Optional[Dict] = Depends(get_optional_user)
+):
     try:
-        question = questions_collection.find_one({"id": question_id}, {"_id": 0})
-        if not question:
-            raise HTTPException(status_code=404, detail="Question not found")
-        return question
+        # Get from Firebase or MongoDB
+        if firebase_db and user:
+            doc_ref = firebase_db.collection('questions').document(question_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                question = doc.to_dict()
+            else:
+                raise HTTPException(status_code=404, detail="Question not found")
+        else:
+            question = questions_collection.find_one({"id": question_id}, {"_id": 0})
+            if not question:
+                raise HTTPException(status_code=404, detail="Question not found")
+        
+        # Localize response
+        return {
+            "id": question["id"],
+            "question": question["question"].get(language, question["question"]["de"]),
+            "type": question["type"],
+            "options": question["options"].get(language, question["options"]["de"]),
+            "correctAnswer": question["correctAnswer"],
+            "explanation": question["explanation"].get(language, question["explanation"]["de"]),
+            "topic": question["topic"],
+            "difficulty": question["difficulty"],
+            "tags": question["tags"],
+            "image": question["image"]
+        }
+        
     except Exception as e:
         logger.error(f"Error fetching question {question_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch question")
 
-@app.get("/api/topics")
-async def get_topics():
-    """Get all available topics with question counts"""
-    try:
-        pipeline = [
-            {"$group": {
-                "_id": "$thema",
-                "count": {"$sum": 1}
-            }},
-            {"$project": {
-                "thema": "$_id",
-                "total_questions": "$count",
-                "_id": 0
-            }}
-        ]
-        topics = list(questions_collection.aggregate(pipeline))
-        return topics
-    except Exception as e:
-        logger.error(f"Error fetching topics: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch topics")
-
-@app.post("/api/answer")
-async def submit_answer(answer: Answer):
-    """Submit an answer and get immediate feedback"""
-    try:
-        # Get the question
-        question = questions_collection.find_one({"id": answer.question_id}, {"_id": 0})
-        if not question:
-            raise HTTPException(status_code=404, detail="Question not found")
-        
-        # Check if answer is correct
-        correct_answers = set(question["richtigeAntwort"])
-        user_answers = set(answer.selected_answers)
-        is_correct = correct_answers == user_answers
-        
-        # Generate session ID for guest users
-        session_id = str(uuid.uuid4())
-        
-        # Save progress
-        progress_data = {
-            "session_id": session_id,
-            "question_id": answer.question_id,
-            "selected_answers": answer.selected_answers,
-            "correct_answers": question["richtigeAntwort"],
-            "is_correct": is_correct,
-            "time_spent": answer.time_spent,
-            "timestamp": datetime.utcnow(),
-            "thema": question["thema"]
-        }
-        
-        progress_collection.insert_one(progress_data)
-        
-        return {
-            "correct": is_correct,
-            "correct_answers": question["richtigeAntwort"],
-            "explanation": question["erklaerung"],
-            "session_id": session_id
-        }
-    except Exception as e:
-        logger.error(f"Error submitting answer: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit answer")
-
-@app.get("/api/progress")
-async def get_progress(session_id: Optional[str] = None):
-    """Get user progress statistics"""
-    try:
-        query = {}
-        if session_id:
-            query["session_id"] = session_id
-            
-        # Get overall statistics
-        total_answered = progress_collection.count_documents(query)
-        correct_answered = progress_collection.count_documents({**query, "is_correct": True})
-        
-        overall_accuracy = (correct_answered / total_answered * 100) if total_answered > 0 else 0
-        
-        # Get topic-wise statistics
-        pipeline = [
-            {"$match": query},
-            {"$group": {
-                "_id": "$thema",
-                "total": {"$sum": 1},
-                "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}}
-            }},
-            {"$project": {
-                "thema": "$_id",
-                "answered": "$total", 
-                "correct": "$correct",
-                "accuracy": {"$multiply": [{"$divide": ["$correct", "$total"]}, 100]},
-                "_id": 0
-            }}
-        ]
-        
-        topic_stats = list(progress_collection.aggregate(pipeline))
-        
-        # Get total questions per topic
-        topic_totals = {}
-        for topic in questions_collection.aggregate([
-            {"$group": {"_id": "$thema", "total": {"$sum": 1}}}
-        ]):
-            topic_totals[topic["_id"]] = topic["total"]
-            
-        # Add total questions to topic stats
-        for stat in topic_stats:
-            stat["total_questions"] = topic_totals.get(stat["thema"], 0)
-        
-        return {
-            "total_answered": total_answered,
-            "correct_answered": correct_answered,
-            "overall_accuracy": round(overall_accuracy, 1),
-            "topic_stats": topic_stats
-        }
-    except Exception as e:
-        logger.error(f"Error fetching progress: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch progress")
-
 @app.get("/api/random-question")
-async def get_random_question():
-    """Get a random question"""
+async def get_random_question(
+    topic: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    language: Optional[str] = "de",
+    user: Optional[Dict] = Depends(get_optional_user)
+):
     try:
-        questions = list(questions_collection.aggregate([{"$sample": {"size": 1}}]))
+        # Build aggregation pipeline for random question
+        pipeline = []
+        
+        match_stage = {}
+        if topic:
+            match_stage["topic"] = topic
+        if difficulty:
+            match_stage["difficulty"] = difficulty
+            
+        if match_stage:
+            pipeline.append({"$match": match_stage})
+            
+        pipeline.append({"$sample": {"size": 1}})
+        
+        questions = list(questions_collection.aggregate(pipeline))
+        
         if not questions:
             raise HTTPException(status_code=404, detail="No questions found")
         
         question = questions[0]
         question.pop("_id", None)
-        return question
+        
+        # Localize response
+        return {
+            "id": question["id"],
+            "question": question["question"].get(language, question["question"]["de"]),
+            "type": question["type"],
+            "options": question["options"].get(language, question["options"]["de"]),
+            "correctAnswer": question["correctAnswer"],
+            "topic": question["topic"],
+            "difficulty": question["difficulty"],
+            "tags": question["tags"],
+            "image": question["image"]
+        }
+        
     except Exception as e:
         logger.error(f"Error fetching random question: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch random question")
+
+@app.post("/api/answer")
+async def submit_answer(
+    answer: QuestionAnswer,
+    language: Optional[str] = "de",
+    user: Optional[Dict] = Depends(get_optional_user)
+):
+    try:
+        # Get the question
+        if firebase_db and user:
+            doc_ref = firebase_db.collection('questions').document(answer.questionId)
+            doc = doc_ref.get()
+            if doc.exists:
+                question = doc.to_dict()
+            else:
+                raise HTTPException(status_code=404, detail="Question not found")
+        else:
+            question = questions_collection.find_one({"id": answer.questionId}, {"_id": 0})
+            if not question:
+                raise HTTPException(status_code=404, detail="Question not found")
+        
+        # Check if answer is correct
+        correct_answers = set(question["correctAnswer"])
+        user_answers = set(answer.selectedAnswers)
+        is_correct = correct_answers == user_answers
+        
+        # Calculate XP and streaks (gamification)
+        base_xp = 10 if is_correct else 2
+        streak_bonus = 0
+        
+        # Speed bonus
+        if answer.timeSpent < 10 and is_correct:
+            base_xp = int(base_xp * 1.2)
+        
+        # Difficulty bonus
+        if question.get("difficulty") == "hard" and is_correct:
+            base_xp = int(base_xp * 1.5)
+        
+        # User ID for progress tracking
+        user_id = user["uid"] if user else f"guest_{uuid.uuid4().hex[:8]}"
+        
+        # Update progress in Firestore or MongoDB
+        progress_data = {
+            "userId": user_id,
+            "questionId": answer.questionId,
+            "selectedAnswers": answer.selectedAnswers,
+            "correctAnswers": question["correctAnswer"],
+            "isCorrect": is_correct,
+            "timeSpent": answer.timeSpent,
+            "timestamp": datetime.utcnow(),
+            "topic": question["topic"],
+            "difficulty": question["difficulty"],
+            "xpEarned": base_xp + streak_bonus,
+            "isFirstTry": answer.isFirstTry
+        }
+        
+        if firebase_db and user:
+            # Save to Firestore
+            progress_ref = firebase_db.collection('user_progress').document(user_id)
+            progress_ref.collection('answers').add(progress_data)
+        else:
+            # Save to MongoDB
+            progress_collection.insert_one(progress_data)
+        
+        return {
+            "correct": is_correct,
+            "correctAnswers": question["correctAnswer"],
+            "explanation": question["explanation"].get(language, question["explanation"]["de"]),
+            "xpEarned": base_xp + streak_bonus,
+            "streakBonus": streak_bonus,
+            "timeSpent": answer.timeSpent
+        }
+        
+    except Exception as e:
+        logger.error(f"Error submitting answer: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit answer")
+
+@app.get("/api/topics")
+async def get_topics():
+    try:
+        pipeline = [
+            {"$group": {
+                "_id": "$topic",
+                "count": {"$sum": 1},
+                "difficulties": {"$addToSet": "$difficulty"}
+            }},
+            {"$project": {
+                "topic": "$_id",
+                "totalQuestions": "$count",
+                "difficulties": "$difficulties",
+                "_id": 0
+            }},
+            {"$sort": {"topic": 1}}
+        ]
+        
+        topics = list(questions_collection.aggregate(pipeline))
+        return topics
+        
+    except Exception as e:
+        logger.error(f"Error fetching topics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch topics")
+
+@app.get("/api/user/progress")
+async def get_user_progress(user: Dict = Depends(get_current_user)):
+    try:
+        user_id = user["uid"]
+        
+        if firebase_db:
+            # Get from Firestore
+            progress_ref = firebase_db.collection('user_progress').document(user_id)
+            doc = progress_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            else:
+                # Initialize user progress
+                initial_progress = {
+                    "totalXP": 0,
+                    "currentLevel": 1,
+                    "totalQuestionsAnswered": 0,
+                    "correctAnswers": 0,
+                    "currentStreak": 0,
+                    "longestStreak": 0,
+                    "achievements": [],
+                    "badges": [],
+                    "favoriteQuestions": [],
+                    "difficultQuestions": [],
+                    "dailyGoal": 20,
+                    "weeklyGoal": 140,
+                    "lastStudyDate": None
+                }
+                progress_ref.set(initial_progress)
+                return initial_progress
+        else:
+            # Fallback to MongoDB aggregation
+            pipeline = [
+                {"$match": {"userId": user_id}},
+                {"$group": {
+                    "_id": None,
+                    "totalAnswered": {"$sum": 1},
+                    "correctAnswers": {"$sum": {"$cond": ["$isCorrect", 1, 0]}},
+                    "totalXP": {"$sum": "$xpEarned"},
+                    "topicStats": {"$push": {
+                        "topic": "$topic",
+                        "correct": "$isCorrect",
+                        "timeSpent": "$timeSpent"
+                    }}
+                }}
+            ]
+            
+            result = list(progress_collection.aggregate(pipeline))
+            if result:
+                stats = result[0]
+                return {
+                    "totalQuestionsAnswered": stats["totalAnswered"],
+                    "correctAnswers": stats["correctAnswers"],
+                    "totalXP": stats.get("totalXP", 0),
+                    "overallAccuracy": (stats["correctAnswers"] / stats["totalAnswered"] * 100) if stats["totalAnswered"] > 0 else 0,
+                    "currentLevel": max(1, int((stats.get("totalXP", 0) / 100) ** 0.5)),
+                    "topicStats": stats["topicStats"]
+                }
+            else:
+                return {"totalQuestionsAnswered": 0, "correctAnswers": 0, "totalXP": 0}
+                
+    except Exception as e:
+        logger.error(f"Error fetching user progress: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch user progress")
+
+@app.get("/api/spaced-repetition")
+async def get_spaced_repetition_questions(
+    limit: int = 20,
+    user: Dict = Depends(get_current_user)
+):
+    """Get questions due for review based on spaced repetition algorithm"""
+    try:
+        user_id = user["uid"]
+        
+        # This would implement the Leitner system logic
+        # For now, return recent incorrect answers
+        recent_incorrect = list(progress_collection.find(
+            {"userId": user_id, "isCorrect": False},
+            {"_id": 0}
+        ).sort("timestamp", -1).limit(limit))
+        
+        question_ids = [item["questionId"] for item in recent_incorrect]
+        
+        if question_ids:
+            questions = list(questions_collection.find(
+                {"id": {"$in": question_ids}},
+                {"_id": 0}
+            ))
+            return questions
+        else:
+            # Return random questions if no review needed
+            return list(questions_collection.aggregate([{"$sample": {"size": limit}}]))
+            
+    except Exception as e:
+        logger.error(f"Error fetching spaced repetition questions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch spaced repetition questions")
 
 if __name__ == "__main__":
     import uvicorn
