@@ -23,8 +23,7 @@ class Settings(BaseSettings):
     mongo_url: str = Field(default="mongodb://localhost:27017", env="MONGO_URL")
     firebase_project_id: str = Field(default="taxi-learn-app", env="FIREBASE_PROJECT_ID")
     
-    class Config:
-        env_file = ".env"
+    model_config = {"extra": "ignore"}  # Allow extra fields but ignore them
 
 settings = Settings()
 
